@@ -7,10 +7,11 @@ This project serves as an extension to the [Namada Telegram Validator Bot](https
 
 - **Namada ABCI Query Integration**: Directly interact with the Namada blockchain to fetch various types of data and convert into easy-to-read struct.
 - **Proposal Information Support**: Newly added functionality to retrieve detailed information about proposals on the Namada blockchain.
+- **Asynchronous Support**: Enhanced with asynchronous capabilities, allowing for non-blocking data retrieval and processing.
 
 ## Getting Started
 
-To get started with this extension, please refer to the usage example provided in `main.py`. This example demonstrates how to utilize the extended functionalities to interact with the Namada API and fetch required information.
+To get started with this extension, please refer to the usage example provided in `test.py` and `test_async.py`. This example demonstrates how to utilize the extended functionalities to interact with the Namada API and fetch required information.
 
 ## Requirements
 
