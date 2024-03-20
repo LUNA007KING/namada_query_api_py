@@ -1,10 +1,9 @@
 import uuid
 import base64
-import requests
+import aiohttp
 from typing import Any, Dict, Optional, Union, List, Tuple
 from urllib.parse import urljoin
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import asyncio
 from namada_types.general import ValidatorState, ValidatorMetaData, U64
 from namada_types.rust_py import address_parse, commission_pair_parse, proposal_parse, votes_parse, \
     proposal_result_parse
@@ -19,53 +18,50 @@ class Result:
 
 class NamadaProvider:
     def __init__(self, base_url: str, retries: int = 3, backoff_factor: float = 0.3,
-                 status_forcelist: Optional[List[int]] = None):
+                 status_forcelist: Optional[List[int]] = None, timeout: float = 30.0):
         self.base_url = base_url
-        self._session = None
         self.retries = retries
         self.backoff_factor = backoff_factor
         self.status_forcelist = status_forcelist or [429, 500, 502, 503, 504]
+        self.timeout = timeout
+        self._session = None
 
-    @property
-    def session(self) -> requests.Session:
-        if self._session is None:
-            self._session = self._create_session(self.retries, self.backoff_factor, self.status_forcelist)
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
         return self._session
 
-    def _create_session(self, retries: int, backoff_factor: float, status_forcelist: List[int]) -> requests.Session:
-        retry_strategy = Retry(total=retries, read=retries, connect=retries,
-                               backoff_factor=backoff_factor, status_forcelist=status_forcelist)
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session = requests.Session()
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        return session
-
-    def send_request(self, endpoint: str, http_method: str = "GET", **kwargs) -> Result:
+    async def send_request(self, endpoint: str, http_method: str = "GET", **kwargs) -> Result:
         url = urljoin(self.base_url, endpoint)
-        try:
-            response = self.session.request(http_method, url, **kwargs)
-            response.raise_for_status()
-            return Result(True, response.json())
-        except requests.exceptions.HTTPError as e:
-            return Result(False, error=f"HTTP error: {e.response.status_code} {e.response.reason}")
-        except requests.exceptions.RequestException as e:
-            return Result(False, error=f"Request exception: {str(e)}")
+        session = await self._get_session()
+        for attempt in range(self.retries):
+            try:
+                async with session.request(http_method, url, **kwargs) as response:
+                    response.raise_for_status()
+                    json_data = await response.json()
+                    return Result(True, json_data)
+            except aiohttp.ClientResponseError as e:
+                if attempt < self.retries - 1 and e.status in self.status_forcelist:
+                    await asyncio.sleep(self.backoff_factor * (2 ** attempt))
+                else:
+                    return Result(False, error=f"HTTP error: {e.status} {e.message}")
+            except aiohttp.ClientError as e:
+                if attempt >= self.retries - 1:
+                    return Result(False, error=f"Request exception: {str(e)}")
 
-    def send_json_rpc_request(self, rpc_method: str, params: Optional[dict] = None, **kwargs) -> Result:
+    async def send_json_rpc_request(self, rpc_method: str, params: Optional[dict] = None, **kwargs) -> Result:
         json_id = str(uuid.uuid4())
         data = {"jsonrpc": "2.0", "id": json_id, "method": rpc_method, "params": params or []}
-        return self.send_request("", http_method="POST", json=data, headers={"Content-Type": "application/json"},
-                                 **kwargs)
+        return await self.send_request("", http_method="POST", json=data, headers={"Content-Type": "application/json"},
+                                       **kwargs)
 
-    def close(self) -> None:
-        if self._session:
-            self._session.close()
+    async def close(self) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
             self._session = None
 
-    def _fetch_abci_query_value(self, params):
-        """Internal method to fetch and decode the value returned by an ABCI query."""
-        result = self.send_json_rpc_request("abci_query", params)
+    async def _fetch_abci_query_value(self, params):
+        result = await self.send_json_rpc_request("abci_query", params)
         if result.success:
             find_result, value = self._find_key(result.data, 'value')
             if not find_result:
@@ -80,7 +76,6 @@ class NamadaProvider:
 
     @staticmethod
     def _find_key(data: Union[Dict, List], target_key: str) -> Tuple[bool, Any]:
-        """Recursively search for a target key in a nested dictionary or list."""
         if isinstance(data, dict):
             for key, value in data.items():
                 if key == target_key:
@@ -96,13 +91,13 @@ class NamadaProvider:
                     return True, result
         return False, None
 
-    def get_latest_height(self) -> Result:
-        result = self.send_request('status')
+    async def get_latest_height(self) -> Result:
+        result = await self.send_request('status')
         if result.success:
             resp = result.data
             if 'result' in resp:
-                found, height = NamadaProvider._find_key(resp, 'latest_block_height')
-                found, catching_up = NamadaProvider._find_key(resp, 'catching_up')
+                found, height = self._find_key(resp, 'latest_block_height')
+                found, catching_up = self._find_key(resp, 'catching_up')
                 if catching_up:
                     return Result(False, error="Node is still catching up.")
                 if height is not None:
@@ -113,13 +108,13 @@ class NamadaProvider:
                 return Result(False, error="Unexpected response structure.")
         return Result(False, error="Failed to fetch blockchain status.")
 
-    def get_consensus_validators(self, height: int) -> Result:
+    async def get_consensus_validators(self, height: int) -> Result:
         validators_info = []
         page = 1
         per_page = 100
         while True:
             endpoint = f'validators?height={height}&page={page}&per_page={per_page}'
-            result = self.send_request(endpoint, http_method="GET")
+            result = await self.send_request(endpoint, http_method="GET")
             if not result.success:
                 return result
             data = result.data
@@ -135,24 +130,24 @@ class NamadaProvider:
                 break
         return Result(True, validators_info)
 
-    def get_epoch(self):
+    async def get_epoch(self) -> Result:
         params = {"path": f"/shell/epoch"}
-        result = self._fetch_abci_query_value(params)
+        result = await self._fetch_abci_query_value(params)
         if result.success:
             return Result(True, U64.parse(result.data))
         return result
 
-    def get_operator_address_from_tm(self, tm_address: str) -> Result:
+    async def get_operator_address_from_tm(self, tm_address: str) -> Result:
         params = {"path": f"/vp/pos/validator_by_tm_addr/{tm_address}"}
-        result = self._fetch_abci_query_value(params)
+        result = await self._fetch_abci_query_value(params)
         if result.success:
             address = address_parse(result.data[1:])
             return Result(True, address)
         return result
 
-    def get_validator_metadata(self, validator_address: str) -> Result:
+    async def get_validator_metadata(self, validator_address: str) -> Result:
         params = {"path": f"/vp/pos/validator/metadata/{validator_address}"}
-        result = self._fetch_abci_query_value(params)
+        result = await self._fetch_abci_query_value(params)
         if result.success:
             data = ValidatorMetaData.parse(result.data[1:])
             metadata = {
@@ -165,30 +160,30 @@ class NamadaProvider:
             return Result(True, metadata)
         return result
 
-    def get_validator_commission(self, validator_address: str) -> Result:
+    async def get_validator_commission(self, validator_address: str) -> Result:
         params = {"path": f"/vp/pos/validator/commission/{validator_address}"}
-        result = self._fetch_abci_query_value(params)
+        result = await self._fetch_abci_query_value(params)
         if result.success:
             return Result(True, commission_pair_parse(result.data[1:]))
         return result
 
-    def get_validator_state(self, validator_address: str) -> Result:
+    async def get_validator_state(self, validator_address: str) -> Result:
         params = {"path": f"/vp/pos/validator/state/{validator_address}"}
-        result = self._fetch_abci_query_value(params)
+        result = await self._fetch_abci_query_value(params)
         if result.success:
             return Result(True, ValidatorState.parse(result.data[1:]).__class__.__name__)
         return result
 
-    def get_governance_parameters(self) -> Result:
+    async def get_governance_parameters(self) -> Result:
         params = {"path": f"/vp/governance/parameters"}
-        result = self._fetch_abci_query_value(params)
+        result = await self._fetch_abci_query_value(params)
         if result.success:
             return Result(True, result.data)
         return result
 
-    def get_proposal_detail(self, proposal_id: int, epoch: int) -> Result:
+    async def get_proposal_detail(self, proposal_id: int, epoch: int) -> Result:
         params = {"path": f"/vp/governance/proposal/{proposal_id}"}
-        result = self._fetch_abci_query_value(params)
+        result = await self._fetch_abci_query_value(params)
         if result.success:
             value = result.data[1:]
             if value:
@@ -197,9 +192,9 @@ class NamadaProvider:
                 return Result(True, None)
         return result
 
-    def get_votes_info(self, proposal_id: int) -> Result:
+    async def get_votes_info(self, proposal_id: int) -> Result:
         params = {"path": f"/vp/governance/proposal/{proposal_id}/votes"}
-        result = self._fetch_abci_query_value(params)
+        result = await self._fetch_abci_query_value(params)
         if result.success:
             value = result.data
             if value:
@@ -208,9 +203,9 @@ class NamadaProvider:
                 return Result(True, None)
         return result
 
-    def get_proposal_result(self, proposal_id: int) -> Result:
+    async def get_proposal_result(self, proposal_id: int) -> Result:
         params = {"path": f"/vp/governance/stored_proposal_result/{proposal_id}"}
-        result = self._fetch_abci_query_value(params)
+        result = await self._fetch_abci_query_value(params)
         if result.success:
             value = result.data[1:]
             if value:
@@ -219,3 +214,23 @@ class NamadaProvider:
                 return Result(True, None)
         return result
 
+
+# async def main():
+#     provider = NamadaProvider("https://namada-testnet-rpc.blackoreo.xyz")
+#     latest_height_result = await provider.get_latest_height()
+#     if latest_height_result.success:
+#         print("Latest height:", latest_height_result.data)
+#     else:
+#         print("Error fetching latest height:", latest_height_result.error)
+#
+#     resp = await provider.get_epoch()
+#     epoch = resp.data
+#     print(epoch)
+#
+#     resp = await provider.get_proposal_detail(371, epoch)
+#     print(resp.data)
+#     await provider.close()
+#
+#
+# if __name__ == "__main__":
+#     asyncio.run(main())
